@@ -7,32 +7,36 @@ const xlsx = require('xlsx');
 const app = express();
 const PORT = 3000;
 
-// Ensure uploads folder exists
+/* =========================
+   SETUP
+========================= */
 const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
-}
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
-// Serve frontend
 app.use(express.static(path.join(__dirname, '../frontend')));
 app.use(express.json());
 
-// Multer config
 const upload = multer({ dest: uploadDir });
 
-// Utility functions
-const cleanText = (t = '') => t.toLowerCase();
+/* =========================
+   NLP UTILITIES
+========================= */
+const STOP_WORDS = [
+  'the','and','was','were','from','with','while','during','on','in','to',
+  'of','his','her','is','got','due','so','at','by','for','it','as','into'
+];
 
-const classifyHazard = (text) => {
-  text = cleanText(text);
-  if (text.includes('slip') || text.includes('wet') || text.includes('fall')) return 'Slip / Trip / Fall';
-  if (text.includes('hand') || text.includes('finger') || text.includes('hit') || text.includes('cut')) return 'Hand / Finger Injury';
-  if (text.includes('walk') || text.includes('floor')) return 'Housekeeping';
-  if (text.includes('machine') || text.includes('wheel') || text.includes('roller')) return 'Machine Interaction';
-  return 'Other';
-};
+function tokenize(text = '') {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !STOP_WORDS.includes(w));
+}
 
-// API
+/* =========================
+   API
+========================= */
 app.post(
   '/api/analyze',
   upload.fields([
@@ -40,62 +44,158 @@ app.post(
     { name: 'incidentFile', maxCount: 1 }
   ]),
   (req, res) => {
-    console.log('🔥 /api/analyze HIT');
 
-    const nearMissWB = xlsx.readFile(req.files.nearMissFile[0].path);
-    const incidentWB = xlsx.readFile(req.files.incidentFile[0].path);
+    const nearWB = xlsx.readFile(req.files.nearMissFile[0].path);
+    const incWB  = xlsx.readFile(req.files.incidentFile[0].path);
 
-    const nearMissData = xlsx.utils.sheet_to_json(nearMissWB.Sheets[nearMissWB.SheetNames[0]]);
-    const incidentData = xlsx.utils.sheet_to_json(incidentWB.Sheets[incidentWB.SheetNames[0]]);
+    const nearData = xlsx.utils.sheet_to_json(nearWB.Sheets[nearWB.SheetNames[0]]);
+    const incData  = xlsx.utils.sheet_to_json(incWB.Sheets[incWB.SheetNames[0]]);
 
-    // Categorize near misses
-    const nearMissCategoryCount = {};
-    nearMissData.forEach(r => {
-      const cat = classifyHazard(r['NEAR MISS']);
-      nearMissCategoryCount[cat] = (nearMissCategoryCount[cat] || 0) + 1;
+    /* =========================
+       STEP 1: KEYWORD COUNTS (NEAR MISS FOCUS)
+    ========================= */
+    const keywordNearCount = {};
+    const keywordIncidentCount = {};
+    const keywordDetails = {};
+
+    nearData.forEach(row => {
+      tokenize(row['NEAR MISS']).forEach(word => {
+        keywordNearCount[word] = (keywordNearCount[word] || 0) + 1;
+      });
     });
 
-    // Simple escalation logic (category-based)
-    let escalationCount = 0;
-    incidentData.forEach(inc => {
-      const incCat = classifyHazard(inc['INCIDENT']);
-      if (nearMissCategoryCount[incCat]) escalationCount++;
+    incData.forEach(row => {
+      tokenize(row['INCIDENT']).forEach(word => {
+        keywordIncidentCount[word] = (keywordIncidentCount[word] || 0) + 1;
+      });
     });
 
-    // Summary
-    const summary = `
-<b>Total Near Misses:</b> ${nearMissData.length}<br>
-<b>Total Incidents:</b> ${incidentData.length}<br>
-<b>Highest Near Miss Category:</b> ${Object.keys(nearMissCategoryCount)[0]}
+    /* =========================
+       STEP 2: TOP 5 KEYWORDS (BY NEAR MISS)
+    ========================= */
+    const topKeywords = Object.entries(keywordNearCount)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([k]) => k);
+
+    /* =========================
+       STEP 3: LINK DATA TO KEYWORDS
+    ========================= */
+    topKeywords.forEach(k => {
+      keywordDetails[k] = {
+        nearMissCount: keywordNearCount[k] || 0,
+        incidentCount: keywordIncidentCount[k] || 0,
+        nearMissList: [],
+        incidentList: []
+      };
+    });
+
+    nearData.forEach(row => {
+      const text = row['NEAR MISS'].toLowerCase();
+      topKeywords.forEach(k => {
+        if (text.includes(k)) {
+          keywordDetails[k].nearMissList.push(row['NEAR MISS']);
+        }
+      });
+    });
+
+    incData.forEach(row => {
+      const text = row['INCIDENT'].toLowerCase();
+      topKeywords.forEach(k => {
+        if (text.includes(k)) {
+          keywordDetails[k].incidentList.push(row['INCIDENT']);
+        }
+      });
+    });
+
+    /* =========================
+       SUMMARY
+    ========================= */
+    let summary = `
+<b>Total Near Misses:</b> ${nearData.length}<br>
+<b>Total Incidents:</b> ${incData.length}<br><br>
+<b>Top 5 Keywords (Near Miss Driven):</b><br>
 `;
 
-    // Create Excel report
+    topKeywords.forEach(k => {
+      summary += `
+<b>${k}</b> → Near Miss: ${keywordDetails[k].nearMissCount},
+Incident: ${keywordDetails[k].incidentCount}<br>
+`;
+    });
+
+    /* =========================
+       EXCEL REPORT
+    ========================= */
     const reportWB = xlsx.utils.book_new();
-    const reportSheet = [['Category', 'Near Miss Count']];
-    Object.entries(nearMissCategoryCount).forEach(([k, v]) => reportSheet.push([k, v]));
 
-    xlsx.utils.book_append_sheet(reportWB, xlsx.utils.aoa_to_sheet(reportSheet), 'Summary');
+    // Sheet 1: Keyword Summary
+    const summarySheet = [
+      ['Keyword', 'Near Miss Count', 'Incident Count']
+    ];
+    topKeywords.forEach(k => {
+      summarySheet.push([
+        k,
+        keywordDetails[k].nearMissCount,
+        keywordDetails[k].incidentCount
+      ]);
+    });
 
-    const reportName = `Safety_Report_${Date.now()}.xlsx`;
-    const reportPath = path.join(uploadDir, reportName);
-    xlsx.writeFile(reportWB, reportPath);
+    xlsx.utils.book_append_sheet(
+      reportWB,
+      xlsx.utils.aoa_to_sheet(summarySheet),
+      'Keyword Summary'
+    );
 
-    // FINAL RESPONSE (CRITICAL)
+    // Sheet 2: Near Miss Linked Data
+    const nearSheet = [['Keyword', 'Near Miss Description']];
+    topKeywords.forEach(k => {
+      keywordDetails[k].nearMissList.forEach(desc => {
+        nearSheet.push([k, desc]);
+      });
+    });
+
+    xlsx.utils.book_append_sheet(
+      reportWB,
+      xlsx.utils.aoa_to_sheet(nearSheet),
+      'Near Miss Details'
+    );
+
+    // Sheet 3: Incident Linked Data
+    const incSheet = [['Keyword', 'Incident Description']];
+    topKeywords.forEach(k => {
+      keywordDetails[k].incidentList.forEach(desc => {
+        incSheet.push([k, desc]);
+      });
+    });
+
+    xlsx.utils.book_append_sheet(
+      reportWB,
+      xlsx.utils.aoa_to_sheet(incSheet),
+      'Incident Details'
+    );
+
+    const reportName = `Safety_Keyword_Report_${Date.now()}.xlsx`;
+    xlsx.writeFile(reportWB, path.join(uploadDir, reportName));
+
+    /* =========================
+       RESPONSE
+    ========================= */
     res.json({
       summary,
-      nearMissCategoryCount,
-      escalationCount,
+      keywordDetails,
       reportUrl: `/download/${reportName}`
     });
   }
 );
 
-// Download route
+/* =========================
+   DOWNLOAD
+========================= */
 app.get('/download/:file', (req, res) => {
   res.download(path.join(uploadDir, req.params.file));
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`✅ Backend running on http://localhost:${PORT}`);
+  console.log(`✅ Safety AI Analyzer running on http://localhost:${PORT}`);
 });
