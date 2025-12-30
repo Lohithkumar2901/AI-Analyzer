@@ -1,61 +1,44 @@
-let keywordChart;
+let chart;
 
 document.getElementById('uploadForm').addEventListener('submit', async e => {
   e.preventDefault();
 
-  const formData = new FormData();
-  formData.append('nearMissFile', document.getElementById('nearMissFile').files[0]);
-  formData.append('incidentFile', document.getElementById('incidentFile').files[0]);
+  const fd = new FormData();
+  fd.append('safetyObservationFile', document.getElementById('so').files[0]);
+  fd.append('nearMissFile', document.getElementById('nm').files[0]);
+  fd.append('incidentFile', document.getElementById('inc').files[0]);
 
-  const res = await fetch('/api/analyze', {
-    method: 'POST',
-    body: formData
-  });
-
+  const res = await fetch('/api/analyze', { method:'POST', body: fd });
   const data = await res.json();
 
-  // Summary
-  const results = document.getElementById('results');
-  results.classList.remove('d-none');
-  results.innerHTML = data.summary;
+  document.getElementById('soInc').innerText = data.counts.so_inc;
+  document.getElementById('nmInc').innerText = data.counts.nm_inc;
+  document.getElementById('soNmInc').innerText = data.counts.so_nm_inc;
+  document.getElementById('prevented').innerText = data.counts.prevented;
 
-  // Chart
-  const labels = Object.keys(data.keywordDetails);
-  const nearMissCounts = labels.map(k => data.keywordDetails[k].nearMissCount);
-  const incidentCounts = labels.map(k => data.keywordDetails[k].incidentCount);
 
-  if (keywordChart) keywordChart.destroy();
 
-  keywordChart = new Chart(document.getElementById('keywordChart'), {
-    type: 'bar',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Near Miss Count',
-          data: nearMissCounts,
-          backgroundColor: 'rgba(54,162,235,0.8)'
-        },
-        {
-          label: 'Incident Count',
-          data: incidentCounts,
-          backgroundColor: 'rgba(255,99,132,0.8)'
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        title: {
-          display: true,
-          text: 'Top 5 Keywords – Near Miss vs Incident'
-        }
-      }
-    }
-  });
+const labels = data.hazards;
 
-  // Download
-  const btn = document.getElementById('downloadReport');
-  btn.classList.remove('d-none');
-  btn.href = data.reportUrl;
+const soData  = labels.map(h => data.hazardCounts[h].so);
+const nmData  = labels.map(h => data.hazardCounts[h].nm);
+const incData = labels.map(h => data.hazardCounts[h].inc);
+
+if (chart) chart.destroy();
+
+chart = new Chart(document.getElementById('chart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [
+      { label:'Safety Observation', data: soData, backgroundColor:'#0d6efd' },
+      { label:'Near Miss', data: nmData, backgroundColor:'#ffc107' },
+      { label:'Incident', data: incData, backgroundColor:'#dc3545' }
+    ]
+  }
+});
+
+const d = document.getElementById('download');
+d.classList.remove('d-none');
+d.href = data.reportUrl;
 });

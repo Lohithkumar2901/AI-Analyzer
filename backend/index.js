@@ -7,9 +7,7 @@ const xlsx = require('xlsx');
 const app = express();
 const PORT = 3000;
 
-/* =========================
-   SETUP
-========================= */
+/* ================= SETUP ================= */
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
@@ -18,184 +16,275 @@ app.use(express.json());
 
 const upload = multer({ dest: uploadDir });
 
-/* =========================
-   NLP UTILITIES
-========================= */
-const STOP_WORDS = [
-  'the','and','was','were','from','with','while','during','on','in','to',
-  'of','his','her','is','got','due','so','at','by','for','it','as','into'
-];
+/* ================= HAZARD DICTIONARY ================= */
+const HAZARD_MAP = {
+  slip:  ['slip','slipped','floor','oil','wet'],
+  trip:  ['trip','stumble','kept','placed'],
+  hit:   ['hit','struck','impact'],
+  cut:   ['cut','sharp','injury'],
+  wheel: ['wheel','disc','trolley','rim'],
+  hand:  ['hand','finger','palm'],
+  fall:  ['fall','fell','collapse']
+};
 
-function tokenize(text = '') {
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, '')
-    .split(/\s+/)
-    .filter(w => w.length > 3 && !STOP_WORDS.includes(w));
+const safeText = v => v ? String(v).toLowerCase() : '';
+
+function detectHazards(text) {
+  const t = safeText(text);
+  return Object.keys(HAZARD_MAP).filter(h =>
+    HAZARD_MAP[h].some(w => t.includes(w))
+  );
 }
 
-/* =========================
-   API
-========================= */
+function incidentKey(inc) {
+  return inc.treatment_number
+    ? String(inc.treatment_number)
+    : `${inc.incident_date}-${safeText(inc.incident_description).slice(0,40)}`;
+}
+
+/* ================= API ================= */
 app.post(
   '/api/analyze',
   upload.fields([
+    { name: 'safetyObservationFile', maxCount: 1 },
     { name: 'nearMissFile', maxCount: 1 },
     { name: 'incidentFile', maxCount: 1 }
   ]),
   (req, res) => {
+    try {
+      const SO = xlsx.utils.sheet_to_json(
+        xlsx.readFile(req.files.safetyObservationFile[0].path)
+          .Sheets[xlsx.readFile(req.files.safetyObservationFile[0].path).SheetNames[0]]
+      );
+      const NM = xlsx.utils.sheet_to_json(
+        xlsx.readFile(req.files.nearMissFile[0].path)
+          .Sheets[xlsx.readFile(req.files.nearMissFile[0].path).SheetNames[0]]
+      );
+      const INC = xlsx.utils.sheet_to_json(
+        xlsx.readFile(req.files.incidentFile[0].path)
+          .Sheets[xlsx.readFile(req.files.incidentFile[0].path).SheetNames[0]]
+      );
 
-    const nearWB = xlsx.readFile(req.files.nearMissFile[0].path);
-    const incWB  = xlsx.readFile(req.files.incidentFile[0].path);
+      const so_inc = [];
+      const nm_inc = [];
+      const so_nm_inc = [];
+      const prevented = [];
 
-    const nearData = xlsx.utils.sheet_to_json(nearWB.Sheets[nearWB.SheetNames[0]]);
-    const incData  = xlsx.utils.sheet_to_json(incWB.Sheets[incWB.SheetNames[0]]);
+      const soSet = new Set();
+      const nmSet = new Set();
+      const soNmSet = new Set();
 
-    /* =========================
-       STEP 1: KEYWORD COUNTS (NEAR MISS FOCUS)
-    ========================= */
-    const keywordNearCount = {};
-    const keywordIncidentCount = {};
-    const keywordDetails = {};
-
-    nearData.forEach(row => {
-      tokenize(row['NEAR MISS']).forEach(word => {
-        keywordNearCount[word] = (keywordNearCount[word] || 0) + 1;
+      /* ===== Hazard counts (for dashboard) ===== */
+      const hazardCounts = {};
+      Object.keys(HAZARD_MAP).forEach(h => {
+        hazardCounts[h] = { so: 0, nm: 0, inc: 0 };
       });
-    });
 
-    incData.forEach(row => {
-      tokenize(row['INCIDENT']).forEach(word => {
-        keywordIncidentCount[word] = (keywordIncidentCount[word] || 0) + 1;
+      SO.forEach(so => detectHazards(so['Nearmiss observation'])
+        .forEach(h => hazardCounts[h].so++));
+      NM.forEach(nm => detectHazards(nm['Observation'])
+        .forEach(h => hazardCounts[h].nm++));
+      INC.forEach(inc => detectHazards(inc['incident_description'])
+        .forEach(h => hazardCounts[h].inc++));
+
+      /* ===== NM → INCIDENT ===== */
+      NM.forEach(nm => {
+        const nmHaz = detectHazards(nm['Observation']);
+        const nmPlant = nm['Plant'] || 'NA';
+
+        INC.forEach(inc => {
+          const incHaz = detectHazards(inc['incident_description']);
+          const incPlant = inc['plant'] || 'NA';
+
+          nmHaz.forEach(h => {
+            if (incHaz.includes(h)) {
+              const key = `${h}|${incidentKey(inc)}`;
+              if (!nmSet.has(key)) {
+                nmSet.add(key);
+                nm_inc.push([
+                  nmPlant,
+                  h,
+                  nm['Observation'],
+                  incPlant,
+                  inc['incident_description']
+                ]);
+              }
+            }
+          });
+        });
       });
-    });
 
-    /* =========================
-       STEP 2: TOP 5 KEYWORDS (BY NEAR MISS)
-    ========================= */
-    const topKeywords = Object.entries(keywordNearCount)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([k]) => k);
+      /* ===== SO → INCIDENT ===== */
+      SO.forEach(so => {
+        const soHaz = detectHazards(so['Nearmiss observation']);
+        const soPlant = so['Plant code'] || 'NA';
 
-    /* =========================
-       STEP 3: LINK DATA TO KEYWORDS
-    ========================= */
-    topKeywords.forEach(k => {
-      keywordDetails[k] = {
-        nearMissCount: keywordNearCount[k] || 0,
-        incidentCount: keywordIncidentCount[k] || 0,
-        nearMissList: [],
-        incidentList: []
-      };
-    });
+        INC.forEach(inc => {
+          const incHaz = detectHazards(inc['incident_description']);
+          const incPlant = inc['plant'] || 'NA';
 
-    nearData.forEach(row => {
-      const text = row['NEAR MISS'].toLowerCase();
-      topKeywords.forEach(k => {
-        if (text.includes(k)) {
-          keywordDetails[k].nearMissList.push(row['NEAR MISS']);
+          soHaz.forEach(h => {
+            if (incHaz.includes(h)) {
+              const key = `${h}|${incidentKey(inc)}`;
+              if (!soSet.has(key)) {
+                soSet.add(key);
+                so_inc.push([
+                  soPlant,
+                  h,
+                  so['Nearmiss observation'],
+                  incPlant,
+                  inc['incident_description']
+                ]);
+              }
+            }
+          });
+        });
+      });
+
+      /* ===== SO + NM → INCIDENT ===== */
+      SO.forEach(so => {
+        const soHaz = detectHazards(so['Nearmiss observation']);
+        const soPlant = so['Plant code'] || 'NA';
+
+        NM.forEach(nm => {
+          const nmHaz = detectHazards(nm['Observation']);
+          const nmPlant = nm['Plant'] || 'NA';
+
+          INC.forEach(inc => {
+            const incHaz = detectHazards(inc['incident_description']);
+            const incPlant = inc['plant'] || 'NA';
+
+            soHaz.forEach(h => {
+              if (nmHaz.includes(h) && incHaz.includes(h)) {
+                const key = `${h}|${incidentKey(inc)}`;
+                if (!soNmSet.has(key)) {
+                  soNmSet.add(key);
+                  so_nm_inc.push([
+                    soPlant,
+                    nmPlant,
+                    h,
+                    so['Nearmiss observation'],
+                    nm['Observation'],
+                    incPlant,
+                    inc['incident_description']
+                  ]);
+                }
+              }
+            });
+          });
+        });
+      });
+
+      /* ===== PREVENTED RISKS ===== */
+      Object.keys(HAZARD_MAP).forEach(h => {
+        const hasIncident = INC.some(inc =>
+          detectHazards(inc['incident_description']).includes(h)
+        );
+
+        if (!hasIncident) {
+          SO.forEach(so => {
+            const soPlant = so['Plant code'] || 'NA';
+
+            NM.forEach(nm => {
+              const nmPlant = nm['Plant'] || 'NA';
+
+              if (
+                detectHazards(so['Nearmiss observation']).includes(h) &&
+                detectHazards(nm['Observation']).includes(h)
+              ) {
+                prevented.push([
+                  soPlant,
+                  nmPlant,
+                  h,
+                  so['Nearmiss observation'],
+                  nm['Observation'],
+                  'PREVENTED'
+                ]);
+              }
+            });
+          });
         }
       });
-    });
 
-    incData.forEach(row => {
-      const text = row['INCIDENT'].toLowerCase();
-      topKeywords.forEach(k => {
-        if (text.includes(k)) {
-          keywordDetails[k].incidentList.push(row['INCIDENT']);
-        }
+      /* ===== EXCEL REPORT ===== */
+      const wb = xlsx.utils.book_new();
+
+      // Summary (NO plant column)
+      xlsx.utils.book_append_sheet(
+        wb,
+        xlsx.utils.aoa_to_sheet([
+          ['Metric','Count'],
+          ['SO → Incident', so_inc.length],
+          ['NM → Incident', nm_inc.length],
+          ['SO + NM → Incident', so_nm_inc.length],
+          ['Prevented Risks', prevented.length]
+        ]),
+        'Summary'
+      );
+
+      xlsx.utils.book_append_sheet(
+        wb,
+        xlsx.utils.aoa_to_sheet([
+          ['SO Plant','Hazard','SO Observation','Incident Plant','Incident Description'],
+          ...so_inc
+        ]),
+        'SO_to_Incident'
+      );
+
+      xlsx.utils.book_append_sheet(
+        wb,
+        xlsx.utils.aoa_to_sheet([
+          ['NM Plant','Hazard','NM Observation','Incident Plant','Incident Description'],
+          ...nm_inc
+        ]),
+        'NM_to_Incident'
+      );
+
+      xlsx.utils.book_append_sheet(
+        wb,
+        xlsx.utils.aoa_to_sheet([
+          ['SO Plant','NM Plant','Hazard','SO Observation','NM Observation','Incident Plant','Incident Description'],
+          ...so_nm_inc
+        ]),
+        'SO_NM_to_Incident'
+      );
+
+      xlsx.utils.book_append_sheet(
+        wb,
+        xlsx.utils.aoa_to_sheet([
+          ['SO Plant','NM Plant','Hazard','SO Observation','NM Observation','Status'],
+          ...prevented
+        ]),
+        'Prevented_Risks'
+      );
+
+      const reportName = `Safety_Report_${Date.now()}.xlsx`;
+      xlsx.writeFile(wb, path.join(uploadDir, reportName));
+
+      res.json({
+        hazards: Object.keys(HAZARD_MAP),
+        hazardCounts,
+        counts: {
+          so_inc: so_inc.length,
+          nm_inc: nm_inc.length,
+          so_nm_inc: so_nm_inc.length,
+          prevented: prevented.length
+        },
+        reportUrl: `/download/${reportName}`
       });
-    });
 
-    /* =========================
-       SUMMARY
-    ========================= */
-    let summary = `
-<b>Total Near Misses:</b> ${nearData.length}<br>
-<b>Total Incidents:</b> ${incData.length}<br><br>
-<b>Top 5 Keywords (Near Miss Driven):</b><br>
-`;
-
-    topKeywords.forEach(k => {
-      summary += `
-<b>${k}</b> → Near Miss: ${keywordDetails[k].nearMissCount},
-Incident: ${keywordDetails[k].incidentCount}<br>
-`;
-    });
-
-    /* =========================
-       EXCEL REPORT
-    ========================= */
-    const reportWB = xlsx.utils.book_new();
-
-    // Sheet 1: Keyword Summary
-    const summarySheet = [
-      ['Keyword', 'Near Miss Count', 'Incident Count']
-    ];
-    topKeywords.forEach(k => {
-      summarySheet.push([
-        k,
-        keywordDetails[k].nearMissCount,
-        keywordDetails[k].incidentCount
-      ]);
-    });
-
-    xlsx.utils.book_append_sheet(
-      reportWB,
-      xlsx.utils.aoa_to_sheet(summarySheet),
-      'Keyword Summary'
-    );
-
-    // Sheet 2: Near Miss Linked Data
-    const nearSheet = [['Keyword', 'Near Miss Description']];
-    topKeywords.forEach(k => {
-      keywordDetails[k].nearMissList.forEach(desc => {
-        nearSheet.push([k, desc]);
-      });
-    });
-
-    xlsx.utils.book_append_sheet(
-      reportWB,
-      xlsx.utils.aoa_to_sheet(nearSheet),
-      'Near Miss Details'
-    );
-
-    // Sheet 3: Incident Linked Data
-    const incSheet = [['Keyword', 'Incident Description']];
-    topKeywords.forEach(k => {
-      keywordDetails[k].incidentList.forEach(desc => {
-        incSheet.push([k, desc]);
-      });
-    });
-
-    xlsx.utils.book_append_sheet(
-      reportWB,
-      xlsx.utils.aoa_to_sheet(incSheet),
-      'Incident Details'
-    );
-
-    const reportName = `Safety_Keyword_Report_${Date.now()}.xlsx`;
-    xlsx.writeFile(reportWB, path.join(uploadDir, reportName));
-
-    /* =========================
-       RESPONSE
-    ========================= */
-    res.json({
-      summary,
-      keywordDetails,
-      reportUrl: `/download/${reportName}`
-    });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: 'Analysis failed' });
+    }
   }
 );
 
-/* =========================
-   DOWNLOAD
-========================= */
+/* ================= DOWNLOAD ================= */
 app.get('/download/:file', (req, res) => {
   res.download(path.join(uploadDir, req.params.file));
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Safety AI Analyzer running on http://localhost:${PORT}`);
+  console.log(`✅ Safety Dashboard running on http://localhost:${PORT}`);
 });
