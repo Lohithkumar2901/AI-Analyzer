@@ -18,10 +18,10 @@ const upload = multer({ dest: uploadDir });
 
 /* ================= HAZARD DICTIONARY ================= */
 const HAZARD_MAP = {
-  slip:  ['slip','slipped','floor','oil','wet'],
+  slip:  ['slip','slipped','floor','oil','wet','spillage'],
   trip:  ['trip','stumble','kept','placed'],
+  cut:   ['cut','sharp','burr','knife'],
   hit:   ['hit','struck','impact'],
-  cut:   ['cut','sharp','injury'],
   wheel: ['wheel','disc','trolley','rim'],
   hand:  ['hand','finger','palm'],
   fall:  ['fall','fell','collapse']
@@ -34,6 +34,12 @@ function detectHazards(text) {
   return Object.keys(HAZARD_MAP).filter(h =>
     HAZARD_MAP[h].some(w => t.includes(w))
   );
+}
+
+// PRIMARY hazard = most safety-critical
+function primaryHazard(hazards) {
+  const priority = ['slip','trip','cut','hit','wheel','fall','hand'];
+  return priority.find(h => hazards.includes(h)) || null;
 }
 
 function incidentKey(inc) {
@@ -65,6 +71,31 @@ app.post(
           .Sheets[xlsx.readFile(req.files.incidentFile[0].path).SheetNames[0]]
       );
 
+      /* ===== HAZARD COUNTS (FOR DASHBOARD CHART) ===== */
+const hazardCounts = {};
+Object.keys(HAZARD_MAP).forEach(h => {
+  hazardCounts[h] = { so: 0, nm: 0, inc: 0 };
+});
+
+SO.forEach(so => {
+  detectHazards(so['Nearmiss observation']).forEach(h => {
+    hazardCounts[h].so++;
+  });
+});
+
+NM.forEach(nm => {
+  detectHazards(nm['Observation']).forEach(h => {
+    hazardCounts[h].nm++;
+  });
+});
+
+INC.forEach(inc => {
+  detectHazards(inc['incident_description']).forEach(h => {
+    hazardCounts[h].inc++;
+  });
+});
+
+
       const so_inc = [];
       const nm_inc = [];
       const so_nm_inc = [];
@@ -74,103 +105,97 @@ app.post(
       const nmSet = new Set();
       const soNmSet = new Set();
 
-      /* ===== Hazard counts (for dashboard) ===== */
-      const hazardCounts = {};
-      Object.keys(HAZARD_MAP).forEach(h => {
-        hazardCounts[h] = { so: 0, nm: 0, inc: 0 };
-      });
-
-      SO.forEach(so => detectHazards(so['Nearmiss observation'])
-        .forEach(h => hazardCounts[h].so++));
-      NM.forEach(nm => detectHazards(nm['Observation'])
-        .forEach(h => hazardCounts[h].nm++));
-      INC.forEach(inc => detectHazards(inc['incident_description'])
-        .forEach(h => hazardCounts[h].inc++));
-
-      /* ===== NM → INCIDENT ===== */
+      /* ===== NM → INCIDENT (PRIMARY HAZARD MATCH ONLY) ===== */
       NM.forEach(nm => {
         const nmHaz = detectHazards(nm['Observation']);
+        const nmPrimary = primaryHazard(nmHaz);
         const nmPlant = nm['Plant'] || 'NA';
+        const nmZone = nm['Zone'] || 'NA';
 
         INC.forEach(inc => {
           const incHaz = detectHazards(inc['incident_description']);
-          const incPlant = inc['plant'] || 'NA';
+          const incPrimary = primaryHazard(incHaz);
 
-          nmHaz.forEach(h => {
-            if (incHaz.includes(h)) {
-              const key = `${h}|${incidentKey(inc)}`;
-              if (!nmSet.has(key)) {
-                nmSet.add(key);
-                nm_inc.push([
-                  nmPlant,
-                  h,
-                  nm['Observation'],
-                  incPlant,
-                  inc['incident_description']
-                ]);
-              }
-            }
-          });
+          if (!nmPrimary || nmPrimary !== incPrimary) return;
+
+          const key = `${nmPrimary}|${incidentKey(inc)}`;
+          if (!nmSet.has(key)) {
+            nmSet.add(key);
+            nm_inc.push([
+              nmPlant,
+              nmZone,
+              nmPrimary,
+              nm['Observation'],
+              inc['plant'] || 'NA',
+              inc['zone_code'] || 'NA',
+              inc['incident_description']
+            ]);
+          }
         });
       });
 
       /* ===== SO → INCIDENT ===== */
       SO.forEach(so => {
         const soHaz = detectHazards(so['Nearmiss observation']);
+        const soPrimary = primaryHazard(soHaz);
         const soPlant = so['Plant code'] || 'NA';
+        const soZone = so['Zone code'] || 'NA';
 
         INC.forEach(inc => {
           const incHaz = detectHazards(inc['incident_description']);
-          const incPlant = inc['plant'] || 'NA';
+          const incPrimary = primaryHazard(incHaz);
 
-          soHaz.forEach(h => {
-            if (incHaz.includes(h)) {
-              const key = `${h}|${incidentKey(inc)}`;
-              if (!soSet.has(key)) {
-                soSet.add(key);
-                so_inc.push([
-                  soPlant,
-                  h,
-                  so['Nearmiss observation'],
-                  incPlant,
-                  inc['incident_description']
-                ]);
-              }
-            }
-          });
+          if (!soPrimary || soPrimary !== incPrimary) return;
+
+          const key = `${soPrimary}|${incidentKey(inc)}`;
+          if (!soSet.has(key)) {
+            soSet.add(key);
+            so_inc.push([
+              soPlant,
+              soZone,
+              soPrimary,
+              so['Nearmiss observation'],
+              inc['plant'] || 'NA',
+              inc['zone_code'] || 'NA',
+              inc['incident_description']
+            ]);
+          }
         });
       });
 
       /* ===== SO + NM → INCIDENT ===== */
       SO.forEach(so => {
-        const soHaz = detectHazards(so['Nearmiss observation']);
+        const soPrimary = primaryHazard(detectHazards(so['Nearmiss observation']));
         const soPlant = so['Plant code'] || 'NA';
+        const soZone = so['Zone code'] || 'NA';
 
         NM.forEach(nm => {
-          const nmHaz = detectHazards(nm['Observation']);
+          const nmPrimary = primaryHazard(detectHazards(nm['Observation']));
           const nmPlant = nm['Plant'] || 'NA';
+          const nmZone = nm['Zone'] || 'NA';
+
+          if (!soPrimary || soPrimary !== nmPrimary) return;
 
           INC.forEach(inc => {
-            const incHaz = detectHazards(inc['incident_description']);
-            const incPlant = inc['plant'] || 'NA';
+            const incPrimary = primaryHazard(detectHazards(inc['incident_description']));
+            if (incPrimary !== soPrimary) return;
 
-            soHaz.forEach(h => {
-              if (nmHaz.includes(h) && incHaz.includes(h)) {
-                const key = `${h}|${incidentKey(inc)}`;
-                if (!soNmSet.has(key)) {
-                  soNmSet.add(key);
-                  so_nm_inc.push([
-                    soPlant,
-                    nmPlant,
-                    h,
-                    so['Nearmiss observation'],
-                    nm['Observation'],
-                    incPlant,
-                    inc['incident_description']
-                  ]);
-                }
-              }
-            });
+            const key = `${soPrimary}|${incidentKey(inc)}`;
+            if (!soNmSet.has(key)) {
+              soNmSet.add(key);
+              so_nm_inc.push([
+                soPlant,
+                soZone,
+                nmPlant,
+                nmZone,
+                soPrimary,
+                so['Nearmiss observation'],
+                nm['Observation'],
+                inc['plant'] || 'NA',
+                inc['zone_code'] || 'NA',
+                inc['incident_description']
+              ]);
+            }
           });
         });
       });
@@ -178,23 +203,21 @@ app.post(
       /* ===== PREVENTED RISKS ===== */
       Object.keys(HAZARD_MAP).forEach(h => {
         const hasIncident = INC.some(inc =>
-          detectHazards(inc['incident_description']).includes(h)
+          primaryHazard(detectHazards(inc['incident_description'])) === h
         );
 
         if (!hasIncident) {
           SO.forEach(so => {
-            const soPlant = so['Plant code'] || 'NA';
-
             NM.forEach(nm => {
-              const nmPlant = nm['Plant'] || 'NA';
-
               if (
-                detectHazards(so['Nearmiss observation']).includes(h) &&
-                detectHazards(nm['Observation']).includes(h)
+                primaryHazard(detectHazards(so['Nearmiss observation'])) === h &&
+                primaryHazard(detectHazards(nm['Observation'])) === h
               ) {
                 prevented.push([
-                  soPlant,
-                  nmPlant,
+                  so['Plant code'] || 'NA',
+                  so['Zone code'] || 'NA',
+                  nm['Plant'] || 'NA',
+                  nm['Zone'] || 'NA',
                   h,
                   so['Nearmiss observation'],
                   nm['Observation'],
@@ -206,12 +229,10 @@ app.post(
         }
       });
 
-      /* ===== EXCEL REPORT ===== */
+      /* ===== EXCEL ===== */
       const wb = xlsx.utils.book_new();
 
-      // Summary (NO plant column)
-      xlsx.utils.book_append_sheet(
-        wb,
+      xlsx.utils.book_append_sheet(wb,
         xlsx.utils.aoa_to_sheet([
           ['Metric','Count'],
           ['SO → Incident', so_inc.length],
@@ -222,37 +243,33 @@ app.post(
         'Summary'
       );
 
-      xlsx.utils.book_append_sheet(
-        wb,
+      xlsx.utils.book_append_sheet(wb,
         xlsx.utils.aoa_to_sheet([
-          ['SO Plant','Hazard','SO Observation','Incident Plant','Incident Description'],
+          ['SO Plant','SO Zone','Hazard','SO Observation','Incident Plant','Incident Zone','Incident Description'],
           ...so_inc
         ]),
         'SO_to_Incident'
       );
 
-      xlsx.utils.book_append_sheet(
-        wb,
+      xlsx.utils.book_append_sheet(wb,
         xlsx.utils.aoa_to_sheet([
-          ['NM Plant','Hazard','NM Observation','Incident Plant','Incident Description'],
+          ['NM Plant','NM Zone','Hazard','NM Observation','Incident Plant','Incident Zone','Incident Description'],
           ...nm_inc
         ]),
         'NM_to_Incident'
       );
 
-      xlsx.utils.book_append_sheet(
-        wb,
+      xlsx.utils.book_append_sheet(wb,
         xlsx.utils.aoa_to_sheet([
-          ['SO Plant','NM Plant','Hazard','SO Observation','NM Observation','Incident Plant','Incident Description'],
+          ['SO Plant','SO Zone','NM Plant','NM Zone','Hazard','SO Observation','NM Observation','Incident Plant','Incident Zone','Incident Description'],
           ...so_nm_inc
         ]),
         'SO_NM_to_Incident'
       );
 
-      xlsx.utils.book_append_sheet(
-        wb,
+      xlsx.utils.book_append_sheet(wb,
         xlsx.utils.aoa_to_sheet([
-          ['SO Plant','NM Plant','Hazard','SO Observation','NM Observation','Status'],
+          ['SO Plant','SO Zone','NM Plant','NM Zone','Hazard','SO Observation','NM Observation','Status'],
           ...prevented
         ]),
         'Prevented_Risks'
@@ -261,18 +278,18 @@ app.post(
       const reportName = `Safety_Report_${Date.now()}.xlsx`;
       xlsx.writeFile(wb, path.join(uploadDir, reportName));
 
+
       res.json({
-        hazards: Object.keys(HAZARD_MAP),
-        hazardCounts,
+        hazards: Object.keys(HAZARD_MAP),   // ✅ REQUIRED FOR CHART
+        hazardCounts,                       // ✅ REQUIRED FOR CHART
         counts: {
           so_inc: so_inc.length,
           nm_inc: nm_inc.length,
           so_nm_inc: so_nm_inc.length,
           prevented: prevented.length
         },
-        reportUrl: `/download/${reportName}`
+        reportUrl: `/download/${reportName}` // ✅ REQUIRED FOR DOWNLOAD
       });
-
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: 'Analysis failed' });
@@ -280,7 +297,6 @@ app.post(
   }
 );
 
-/* ================= DOWNLOAD ================= */
 app.get('/download/:file', (req, res) => {
   res.download(path.join(uploadDir, req.params.file));
 });
